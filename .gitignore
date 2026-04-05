@@ -1,0 +1,18 @@
+# OAuth credentials & tokens — NEVER commit these
+client_secret*.json
+token.json
+
+# Environment variables
+.env
+
+# Python virtual environment
+venv/
+
+# Logs
+*.log
+
+# macOS
+.DS_Store
+
+# launchd plist (contains local paths)
+*.plist
