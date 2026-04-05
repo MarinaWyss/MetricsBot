@@ -22,6 +22,7 @@ import argparse
 import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import time
 
 # ---------------------------------------------------------------------------
 # Dependencies
@@ -45,15 +46,7 @@ except ImportError:
     from googleapiclient.discovery import build
     import requests
 
-try:
-    from youtube_transcript_api import YouTubeTranscriptApi
-except ImportError:
-    import subprocess
-    subprocess.check_call([
-        sys.executable, "-m", "pip", "install", "--break-system-packages", "-q",
-        "youtube-transcript-api",
-    ])
-    from youtube_transcript_api import YouTubeTranscriptApi
+import xml.etree.ElementTree as ET
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -225,20 +218,73 @@ def fetch_comments(youtube, video_id: str, max_comments: int = 100) -> list[str]
     return comments
 
 
-def fetch_transcript(video_id: str) -> list[dict]:
-    """Fetch video transcript/captions using youtube-transcript-api."""
+def fetch_transcript(youtube, video_id: str) -> list[dict]:
+    """Fetch video transcript via the official YouTube Captions API.
+
+    Uses captions.list() to find an English caption track, then
+    captions.download() to get the timed text. Requires youtube.force-ssl
+    scope and channel ownership.
+    """
     try:
-        # youtube-transcript-api v1.x: instance-based API
-        ytt = YouTubeTranscriptApi()
-        fetched = ytt.fetch(video_id, languages=["en"])
-        return [
-            {
-                "start": round(snippet.start, 1),
-                "duration": round(snippet.duration, 1),
-                "text": snippet.text,
-            }
-            for snippet in fetched
-        ]
+        # List available caption tracks
+        captions_resp = youtube.captions().list(
+            part="snippet", videoId=video_id
+        ).execute()
+
+        # Find an English caption track (prefer manual, fall back to auto)
+        caption_id = None
+        for item in captions_resp.get("items", []):
+            lang = item["snippet"].get("language", "")
+            track_kind = item["snippet"].get("trackKind", "")
+            if lang.startswith("en"):
+                if track_kind != "ASR":
+                    # Manual/standard caption — prefer this
+                    caption_id = item["id"]
+                    break
+                elif caption_id is None:
+                    # Auto-generated — use as fallback
+                    caption_id = item["id"]
+
+        if not caption_id:
+            log.warning(f"No English captions found for {video_id}")
+            return []
+
+        # Download the caption track as SRT
+        srt_content = youtube.captions().download(
+            id=caption_id, tfmt="srt"
+        ).execute()
+
+        # Parse SRT into segments
+        if isinstance(srt_content, bytes):
+            srt_content = srt_content.decode("utf-8")
+
+        segments = []
+        blocks = srt_content.strip().split("\n\n")
+        for block in blocks:
+            lines = block.strip().split("\n")
+            if len(lines) >= 3:
+                # Parse timestamp line: "00:00:01,234 --> 00:00:04,567"
+                time_line = lines[1]
+                text = " ".join(lines[2:])
+                try:
+                    start_str = time_line.split(" --> ")[0].strip()
+                    end_str = time_line.split(" --> ")[1].strip()
+
+                    def srt_to_seconds(ts):
+                        parts = ts.replace(",", ".").split(":")
+                        return float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
+
+                    start = srt_to_seconds(start_str)
+                    end = srt_to_seconds(end_str)
+                    segments.append({
+                        "start": round(start, 1),
+                        "duration": round(end - start, 1),
+                        "text": text,
+                    })
+                except (ValueError, IndexError):
+                    continue
+
+        return segments
     except Exception as e:
         log.warning(f"Transcript failed for {video_id}: {e}")
         return []
@@ -737,6 +783,10 @@ def main():
         vid = v["video_id"]
         log.info(f"\n[{i}/{len(videos)}] {v['title'][:50]}...")
 
+        # Throttle requests to avoid YouTube IP bans
+        if i > 1:
+            time.sleep(2)
+
         # Daily views for trend chart
         log.info("  Fetching daily views...")
         daily = fetch_daily_views(yt_analytics, vid, v["published_at"])
@@ -751,7 +801,7 @@ def main():
 
         # Transcript
         log.info("  Fetching transcript...")
-        transcript = fetch_transcript(vid)
+        transcript = fetch_transcript(youtube, vid)
 
         # Comments
         log.info("  Fetching comments...")
